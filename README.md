@@ -59,6 +59,13 @@ When running the installer manually, you can pass parameters to customize or aut
 | `--id <CTID>` | Specify the target Container ID (100–999) | `bash install.sh --id 999` |
 | `--hostname <name>` | Specify the container hostname | `bash install.sh --hostname frigate` |
 | `--mount <host>:<guest>` | Configure a custom external storage bind mount | `bash install.sh --mount /mnt/data:/opt/storage` |
+| `--cctv-ip <ip/cidr>` | Add a second NIC (`eth1`) for the CCTV network with this fixed IP | `bash install.sh --cctv-ip 10.10.20.5/24` |
+| `--cctv-vlan <tag>` | VLAN tag (1–4094) for the CCTV NIC; omit for untagged | `bash install.sh --cctv-ip 10.10.20.5/24 --cctv-vlan 20` |
+| `--cctv-bridge <bridge>` | Bridge for the CCTV NIC (default: same as the primary NIC) | `bash install.sh --cctv-ip 10.10.20.5/24 --cctv-bridge vmbr1` |
+
+#### CCTV network (second NIC)
+
+During interactive setup you are asked whether to add a second network interface for a dedicated camera network. If you answer yes, you enter the bridge, an optional VLAN tag and a fixed IP address (CIDR, e.g. `10.10.20.5/24`). The NIC is created as `net1` (`eth1`) without a gateway, so the default route stays on the primary interface. To use a VLAN tag, the bridge must be VLAN-aware (*Node → System → Network → bridge → VLAN aware*).
 
 #### What the installer does:
 1. Prompts for container ID, hostname, CPU/RAM, and target storage.

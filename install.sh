@@ -13,6 +13,9 @@ CT_ID=""
 CT_HOSTNAME=""
 CLI_MEDIA_PATH=""
 DRY_RUN=false
+CCTV_IP=""
+CCTV_VLAN=""
+CCTV_BRIDGE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -43,6 +46,18 @@ while [[ $# -gt 0 ]]; do
             ;;
         --media-path)
             CLI_MEDIA_PATH="$2"
+            shift 2
+            ;;
+        --cctv-ip)
+            CCTV_IP="$2"
+            shift 2
+            ;;
+        --cctv-vlan)
+            CCTV_VLAN="$2"
+            shift 2
+            ;;
+        --cctv-bridge)
+            CCTV_BRIDGE="$2"
             shift 2
             ;;
         *)
@@ -199,6 +214,9 @@ echo "--- Configuration ---"
 NEXT_CTID=$(pvesh get /cluster/nextid 2>/dev/null || echo "100")
 CLI_CT_ID="${CT_ID:-}"
 CLI_CT_HOSTNAME="${CT_HOSTNAME:-}"
+CLI_CCTV_IP="$CCTV_IP"
+CLI_CCTV_VLAN="$CCTV_VLAN"
+CLI_CCTV_BRIDGE="$CCTV_BRIDGE"
 
 if [ "$NON_INTERACTIVE" = true ]; then
     log_info "Running in non-interactive/silent mode. Auto-applying all defaults."
@@ -216,6 +234,8 @@ if [ "$NON_INTERACTIVE" = true ]; then
     NET_BRIDGE="vmbr0"
     NET_IP="dhcp"
     NET_GW=""
+    # Second (CCTV) NIC is only added when --cctv-ip is given
+    CCTV_BRIDGE="${CLI_CCTV_BRIDGE:-$NET_BRIDGE}"
     configure_gpu="Y"
     configure_coral="Y"
     create_snapshot_choice="Y"
@@ -291,6 +311,30 @@ else
         read -p "Enter Default Gateway (e.g. 192.168.1.1): " NET_GW
     fi
 
+    # Second NIC for the CCTV / camera network
+    if [ -n "$CLI_CCTV_IP" ]; then
+        add_cctv_nic="Y"
+    else
+        read -p "Add a second network interface (eth1) for the CCTV network? (y/N): " add_cctv_nic
+        add_cctv_nic=${add_cctv_nic:-N}
+    fi
+    if [[ "$add_cctv_nic" =~ ^[Yy]$ ]]; then
+        read -p "Enter CCTV Network Bridge (default: ${CLI_CCTV_BRIDGE:-$NET_BRIDGE}): " CCTV_BRIDGE
+        CCTV_BRIDGE=${CCTV_BRIDGE:-${CLI_CCTV_BRIDGE:-$NET_BRIDGE}}
+
+        read -p "Enter CCTV VLAN tag [1-4094] (blank for untagged${CLI_CCTV_VLAN:+, default: $CLI_CCTV_VLAN}): " CCTV_VLAN
+        CCTV_VLAN=${CCTV_VLAN:-$CLI_CCTV_VLAN}
+
+        CCTV_IP=""
+        while [ -z "$CCTV_IP" ]; do
+            read -p "Enter CCTV Fixed IP Address (e.g. 10.10.20.5/24${CLI_CCTV_IP:+, default: $CLI_CCTV_IP}): " CCTV_IP
+            CCTV_IP=${CCTV_IP:-$CLI_CCTV_IP}
+        done
+    else
+        CCTV_IP=""
+        CCTV_VLAN=""
+    fi
+
     # Post-Install Snapshot
     read -p "Create a post-installation snapshot of the container? (Y/n): " create_snapshot_choice
     create_snapshot_choice=${create_snapshot_choice:-Y}
@@ -311,6 +355,20 @@ fi
 
 if [ "$DRY_RUN" = false ] && pct status "$CT_ID" &>/dev/null; then
     error_exit "Container ID $CT_ID is already in use."
+fi
+
+if [ -n "$CCTV_IP" ]; then
+    if [[ ! "$CCTV_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+        error_exit "Invalid CCTV IP address '$CCTV_IP'. Use CIDR notation, e.g. 10.10.20.5/24."
+    fi
+    if [ -n "$CCTV_VLAN" ] && { [[ ! "$CCTV_VLAN" =~ ^[0-9]+$ ]] || [ "$CCTV_VLAN" -lt 1 ] || [ "$CCTV_VLAN" -gt 4094 ]; }; then
+        error_exit "Invalid CCTV VLAN tag '$CCTV_VLAN'. Must be between 1 and 4094."
+    fi
+    if [ "$CCTV_IP" = "$NET_IP" ]; then
+        error_exit "CCTV IP address must differ from the primary IP address."
+    fi
+elif [ -n "$CCTV_VLAN" ]; then
+    error_exit "A CCTV VLAN was given without a CCTV IP address (--cctv-ip)."
 fi
 
 if ! echo "$ROOTFS_STORAGES" | grep -q "^$CT_STORAGE$"; then
@@ -451,6 +509,17 @@ else
     fi
     NET0_CONF="${NET0_CONF},host-managed=1"
 
+    # Build net1 (CCTV) configuration. No gateway: the default route stays on eth0.
+    NET1_ARGS=()
+    if [ -n "$CCTV_IP" ]; then
+        NET1_CONF="name=eth1,bridge=$CCTV_BRIDGE,ip=$CCTV_IP"
+        if [ -n "$CCTV_VLAN" ]; then
+            NET1_CONF="${NET1_CONF},tag=${CCTV_VLAN}"
+        fi
+        NET1_CONF="${NET1_CONF},host-managed=1"
+        NET1_ARGS=(--net1 "$NET1_CONF")
+    fi
+
     pct create "$CT_ID" "${TEMPLATE_STORAGE}:vztmpl/${OCI_TEMPLATE_NAME}.tar" \
         --hostname "$CT_HOSTNAME" \
         --cores "$CT_CORES" \
@@ -458,6 +527,7 @@ else
         --swap "$CT_SWAP" \
         --rootfs "${CT_STORAGE}:${CT_DISK}" \
         --net0 "$NET0_CONF" \
+        "${NET1_ARGS[@]}" \
         --onboot 1 \
         --ostype unmanaged \
         --unprivileged 1 || error_exit "Failed to create container."
@@ -671,6 +741,11 @@ if [ "$CORAL_TYPE" != "none" ]; then
     CORAL_LINE="- Coral Detector: ${CORAL_TYPE}\\n"
 fi
 
+CCTV_LINE=""
+if [ -n "$CCTV_IP" ]; then
+    CCTV_LINE="- CCTV Network (eth1): ${CCTV_IP} on ${CCTV_BRIDGE}${CCTV_VLAN:+ (VLAN ${CCTV_VLAN})}\\n"
+fi
+
 MOUNT_LINE=""
 if [ -n "$CUSTOM_MOUNT_HOST" ] && [ -n "$CUSTOM_MOUNT_CONTAINER" ]; then
     CLEAN_CONTAINER_PATH=$(echo "$CUSTOM_MOUNT_CONTAINER" | sed 's/^\///')
@@ -690,7 +765,7 @@ DESCRIPTION=$(echo -e "# Frigate OCI Script
 
 **Hardware Profile**
 - GPU Acceleration: ${GPU_TYPE}
-${CORAL_LINE}- Resources: ${CT_RAM}MB RAM / ${CT_CORES} CPU Cores
+${CORAL_LINE}${CCTV_LINE}- Resources: ${CT_RAM}MB RAM / ${CT_CORES} CPU Cores
 
 **File Locations**
 - Configuration: ${HOST_CONFIG_PATH}/config.yml
