@@ -665,44 +665,74 @@ EOF
     mkdir -p "$SNIPPETS_DIR"
     HOOKSCRIPT_PATH="${SNIPPETS_DIR}/ct${CT_ID}-network.sh"
 
-    if [ "$NET_IP" = "dhcp" ]; then
-        NET_CMD="nsenter -t \"\\\$CT_PID\" -n dhclient eth0 2>/dev/null || nsenter -t \"\\\$CT_PID\" -n udhcpc -i eth0 2>/dev/null"
-    else
-        NET_CMD="nsenter -t \"\\\$CT_PID\" -n ip addr add $NET_IP dev eth0 2>/dev/null
-        nsenter -t \"\\\$CT_PID\" -n ip route add default via $NET_GW 2>/dev/null"
-    fi
-
+    # Values are baked into a small header; the body is a quoted heredoc so
+    # nothing in it is expanded at install time.
     cat > "$HOOKSCRIPT_PATH" << EOF
 #!/bin/bash
-# Proxmox hookscript: configure network and flush IPv6 for CT \${CT_ID}
+# Proxmox hookscript: bring up loopback, disable IPv6 and enforce static
+# addresses inside CT ${CT_ID} after it starts.
+CT_ID="${CT_ID}"
+NET_IP="${NET_IP}"
+NET_GW="${NET_GW}"
+CCTV_IP="${CCTV_IP}"
+EOF
 
-VMID="\\\$1"
-PHASE="\\\$2"
+    cat >> "$HOOKSCRIPT_PATH" << 'EOF'
 
-if [ "\\\$VMID" != "$CT_ID" ] || [ "\\\$PHASE" != "post-start" ]; then
+VMID="$1"
+PHASE="$2"
+
+if [ "$VMID" != "$CT_ID" ] || [ "$PHASE" != "post-start" ]; then
     exit 0
 fi
 
-# Run in background via setsid to release PVE startup task immediately
-setsid bash -c '
+configure_network() {
+    local ct_pid=""
     for i in {1..50}; do
-        CT_PID=\\\$(lxc-info -n $CT_ID -p -H 2>/dev/null)
-        if [ -n "\\\$CT_PID" ]; then
-            break
-        fi
-        sleep 0.05
+        ct_pid=$(lxc-info -n "$CT_ID" -p -H 2>/dev/null)
+        [ -n "$ct_pid" ] && break
+        sleep 0.1
     done
-    if [ -n "\\\$CT_PID" ]; then
-        echo \"ct\${CT_ID}-network: configuring network inside PID \\\$CT_PID...\"
-        nsenter -t \"\\\$CT_PID\" -n sysctl -w net.ipv6.conf.all.disable_ipv6=1
-        nsenter -t \"\\\$CT_PID\" -n sysctl -w net.ipv6.conf.default.disable_ipv6=1
-        nsenter -t \"\\\$CT_PID\" -n sysctl -w net.ipv6.conf.eth0.disable_ipv6=1
-        nsenter -t \"\\\$CT_PID\" -n ip link set lo up
-        nsenter -t \"\\\$CT_PID\" -n ip link set eth0 up
-        $NET_CMD
-        echo \"ct\${CT_ID}-network: network configured successfully\"
+    if [ -z "$ct_pid" ]; then
+        echo "ct${CT_ID}-network: container PID not found, giving up"
+        return 1
     fi
-' > /var/log/ct\${CT_ID}-network.log 2>&1 &
+
+    ns() { nsenter -t "$ct_pid" -n "$@"; }
+
+    echo "ct${CT_ID}-network: configuring network inside PID $ct_pid..."
+    ns sysctl -qw net.ipv6.conf.all.disable_ipv6=1
+    ns sysctl -qw net.ipv6.conf.default.disable_ipv6=1
+    ns ip link set lo up
+
+    for dev in eth0 eth1; do
+        if ns ip link show "$dev" &>/dev/null; then
+            ns sysctl -qw "net.ipv6.conf.${dev}.disable_ipv6=1"
+            ns ip link set "$dev" up
+        fi
+    done
+
+    # DHCP on eth0 is handled by Proxmox (host-managed=1). Running a DHCP
+    # client from here would use the host's mount namespace and could
+    # overwrite the host's /etc/resolv.conf, so only static addresses are
+    # (re)applied. 'replace' makes this idempotent.
+    if [ "$NET_IP" != "dhcp" ]; then
+        ns ip addr replace "$NET_IP" dev eth0
+        if [ -n "$NET_GW" ]; then
+            ns ip route replace default via "$NET_GW" dev eth0
+        fi
+    fi
+
+    if [ -n "$CCTV_IP" ]; then
+        ns ip addr replace "$CCTV_IP" dev eth1
+    fi
+
+    echo "ct${CT_ID}-network: network configured successfully"
+}
+
+# Run in the background with redirected output so the PVE start task is
+# released immediately.
+configure_network < /dev/null > "/var/log/ct${CT_ID}-network.log" 2>&1 &
 
 exit 0
 EOF
