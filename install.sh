@@ -669,8 +669,8 @@ EOF
     # nothing in it is expanded at install time.
     cat > "$HOOKSCRIPT_PATH" << EOF
 #!/bin/bash
-# Proxmox hookscript: bring up loopback, disable IPv6 and enforce static
-# addresses inside CT ${CT_ID} after it starts.
+# Proxmox hookscript for CT ${CT_ID}: bring up loopback, disable IPv6 and
+# enforce static addresses after start; restart the CT if Frigate exits.
 CT_ID="${CT_ID}"
 NET_IP="${NET_IP}"
 NET_GW="${NET_GW}"
@@ -682,7 +682,7 @@ EOF
 VMID="$1"
 PHASE="$2"
 
-if [ "$VMID" != "$CT_ID" ] || [ "$PHASE" != "post-start" ]; then
+if [ "$VMID" != "$CT_ID" ]; then
     exit 0
 fi
 
@@ -730,9 +730,73 @@ configure_network() {
     echo "ct${CT_ID}-network: network configured successfully"
 }
 
-# Run in the background with redirected output so the PVE start task is
-# released immediately.
-configure_network < /dev/null > "/var/log/ct${CT_ID}-network.log" 2>&1 &
+# Succeeds when the stop was requested through Proxmox (pct/GUI stop,
+# shutdown, reboot, backup, migration, host shutdown). Errors count as
+# "requested" so the container is never restarted against the user's wishes.
+stop_was_requested() {
+    pvesh get /nodes/localhost/tasks --source active --output-format json 2>/dev/null | python3 -c '
+import sys, json
+vmid = sys.argv[1]
+try:
+    tasks = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for t in tasks:
+    if t.get("endtime"):
+        continue
+    if str(t.get("id", "")) == vmid or t.get("type") in ("stopall", "vzdump", "migrateall"):
+        sys.exit(0)
+sys.exit(1)
+' "$CT_ID"
+}
+
+# Frigate halts the whole container whenever it exits: UI restart, config
+# save, MQTT restart, or its watchdog after a detector failure. Docker brings
+# it back via a restart policy; Proxmox has none, so do it here.
+restart_after_frigate_exit() {
+    log() { echo "$(date '+%F %T') $*"; }
+    sleep 2
+    if [ "$(systemctl is-system-running 2>/dev/null)" = "stopping" ]; then
+        log "host is shutting down, not restarting"
+        return 0
+    fi
+    if stop_was_requested; then
+        log "stop was requested through Proxmox (or task list unreadable), not restarting"
+        return 0
+    fi
+
+    # Crash-loop guard: at most 5 automatic restarts per 15 minutes
+    local history="/run/frigate-ct${CT_ID}-restarts" now recent=() ts
+    now=$(date +%s)
+    if [ -f "$history" ]; then
+        while read -r ts; do
+            [ -n "$ts" ] && [ $((now - ts)) -lt 900 ] && recent+=("$ts")
+        done < "$history"
+    fi
+    if [ "${#recent[@]}" -ge 5 ]; then
+        log "restarted ${#recent[@]} times in 15 minutes, giving up; check the Frigate logs"
+        return 1
+    fi
+    printf '%s\n' "${recent[@]}" "$now" > "$history"
+
+    for i in {1..30}; do
+        pct status "$CT_ID" 2>/dev/null | grep -q "stopped" && break
+        sleep 1
+    done
+    log "Frigate exited on its own, restarting CT ${CT_ID}"
+    pct start "$CT_ID"
+}
+
+# Run in the background with redirected output so the PVE task is released
+# immediately.
+case "$PHASE" in
+    post-start)
+        configure_network < /dev/null > "/var/log/ct${CT_ID}-network.log" 2>&1 &
+        ;;
+    post-stop)
+        restart_after_frigate_exit < /dev/null >> "/var/log/ct${CT_ID}-autorestart.log" 2>&1 &
+        ;;
+esac
 
 exit 0
 EOF

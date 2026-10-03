@@ -16,7 +16,7 @@ This script eliminates the resource overhead and nesting requirements of running
 * **Unprivileged by Default**: Stronger isolation and security compared to privileged Docker-in-LXC stacks.
 * **Hardware Acceleration**: Automatic configuration of Intel iGPU, AMD, or Nvidia GPUs using Proxmox 8.2+ `dev[n]` mappings.
 * **Google Coral Support**: Seamless passthrough for both PCIe Coral (Apex) and USB Coral TPUs.
-* **WebRTC & Network Hookscript**: Automatically provisions a background `post-start` network hookscript to configure the loopback interface, static routes, and flush IPv6 addresses inside the container namespace, enabling flawless out-of-the-box `go2rtc` WebRTC streaming.
+* **WebRTC & Network Hookscript**: Automatically provisions a background `post-start` network hookscript to configure the loopback interface, static routes, and flush IPv6 addresses inside the container namespace, enabling flawless out-of-the-box `go2rtc` WebRTC streaming. The same hookscript restarts the container when Frigate exits on its own (UI restart, config save, or a detector failure), the way Docker's restart policy would. It does not restart the container when you stop it through Proxmox, and gives up after 5 restarts in 15 minutes. Restarts are logged to `/var/log/ct<CTID>-autorestart.log` on the host.
 * **State Persistence**: Mounts host directories for configuration and media files, ensuring no data loss when container is recreated.
 * **Seamless Upgrades**: An intelligent `update.sh` script that automates container teardown, pulls the new OCI template, and recreates the container while restoring all environment variables, resources, and hardware passthrough configurations.
 
